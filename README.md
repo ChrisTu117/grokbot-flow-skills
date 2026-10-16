@@ -5,9 +5,9 @@
 | Skill | 路径 | 原文地址 | 规范化 SHA-256 |
 |---|---|---|---|
 | 上手 | `skills/onboarding/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/onboarding/SKILL.md | `894d37319d2473e822a766aa16b491a8b875a556b281f011a9effa872eb5e123` |
-| 创世 | `skills/genesis/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/genesis/SKILL.md | `28ae6ba221746d699f1f04d27bcd7df04ff4e39d43c22dcfb3e9b5f95d06d155` |
-| 固定bot设定 | `skills/fixed-bot-settings/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/fixed-bot-settings/SKILL.md | `3ce492fa2d75e2d5a24acb8b5f5e70b5912e98c18eec4a1349a349aed5854ff0` |
-| 参谋长治理 | `skills/chief-of-staff-governance/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/chief-of-staff-governance/SKILL.md | `ebf7d7554e9e5143128fef95a9504d4eae6713327d33a78a653b2f21aa94af69` |
+| 创世 | `skills/genesis/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/genesis/SKILL.md | `f298910ae78171c3b19782d37351bad3171adb6a9fc2dd1df0acfad76d2d43ff` |
+| 固定bot设定 | `skills/fixed-bot-settings/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/fixed-bot-settings/SKILL.md | `7ff3de516a4b36dbe17b0ff569064a6b5942edb1ee355ed5bc004a2708fd1a4f` |
+| 参谋长治理 | `skills/chief-of-staff-governance/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/chief-of-staff-governance/SKILL.md | `e5132f192d41b19d79e9e803074cba91452fd96e60688ef07b74f1ba7ddd5234` |
 | 通用流程 | `skills/general-flow/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/general-flow/SKILL.md | `7d9a1ae291c2c5787d96eb0ea99bfd18e3c65e2681105770e633b60dbca7a09d` |
 
 ## 计算哈希
