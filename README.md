@@ -4,10 +4,10 @@
 
 | Skill | 路径 | 原文地址 | 规范化 SHA-256 |
 |---|---|---|---|
-| 上手 | `skills/onboarding/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/onboarding/SKILL.md | `58675a39212752b11a2eca0fbac95efd60423bb64786d9b9aaf1b6a35f10b65c` |
-| 创世 | `skills/genesis/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/genesis/SKILL.md | `b910f89d9fee11cdfc0dd208f8865099c8d79f689aadad6fd6c85d2c2cb81066` |
-| 固定bot设定 | `skills/fixed-bot-settings/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/fixed-bot-settings/SKILL.md | `c9b5ba313d6e1f7d5061d8a4b8998b5a6e49ffbe16baee7068705c92483dd808` |
-| 参谋长治理 | `skills/chief-of-staff-governance/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/chief-of-staff-governance/SKILL.md | `fca8a88c8fde0e4f2f030c62ba877736a5507c69b188430a047886dba0b5f069` |
+| 上手 | `skills/onboarding/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/onboarding/SKILL.md | `38559bb0c8bb19b2782aa67e5c1fdc7c5f054d4f2efbb5abd3c073f028c19b89` |
+| 创世 | `skills/genesis/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/genesis/SKILL.md | `81f61478f67e69186a693f7bcefdc49b70dc318a6301c10b546f7ef149f23f21` |
+| 固定bot设定 | `skills/fixed-bot-settings/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/fixed-bot-settings/SKILL.md | `7cfb1c09cbd221f4c0781e0dbb0b8e81ea9daa8c4194962af55e8868cd598a93` |
+| 参谋长治理 | `skills/chief-of-staff-governance/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/chief-of-staff-governance/SKILL.md | `e8fa9aa63589688b20d26eea7541bff18e1e1c03efd0f0836f499392e72b130e` |
 | 通用流程 | `skills/general-flow/SKILL.md` | https://raw.githubusercontent.com/ChrisTu117/grokbot-flow-skills/main/skills/general-flow/SKILL.md | `7d9a1ae291c2c5787d96eb0ea99bfd18e3c65e2681105770e633b60dbca7a09d` |
 
 ## 计算哈希
