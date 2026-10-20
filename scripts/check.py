@@ -1,158 +1,45 @@
 #!/usr/bin/env python3
-"""检查脚本 v0.0.1（草稿 3）——纯标准库 Python 3。只做两件事：导出完整性（含编号缺号、行数不减）和治理哈希核对。
+"""检查脚本——纯标准库 Python 3，放在本项目仓库的 scripts/ 下，直接在本机克隆（/home/box/flow-repo）里运行。
+只做两件事：导出完整性（含编号缺号、行数不减）；带 --governance 时再做本机对仓库比对（含落后清单）。
 通用流程第 10 节机械项 1–11 不归本脚本，由人工按清单检查。
 
 用法：
-  python3 check.py run --export-dir 导出目录 [--agents-dir DIR] [--workflows-dir DIR] [--prev 上次结果.json] [--out 结果.json]
-  python3 check.py escape 原文文件            # 输出写入 Notion 前的转义文本（stdout）
-  python3 check.py verify-text --original 原文文件 --export 导出文件 --page-id ID --field 字段名
-                                              # 写入后读回核对：view/fetch 导出还原后与原文哈希比
-  python3 check.py selftest [--fixtures DIR]  # 单测 demarkdown2 / escape_md / 解析
+  python3 check.py run [--export-dir 导出目录] [--governance] [--repo DIR] [--agents-dir DIR] [--workflows-dir DIR]
+                       [--prev 上次结果.json] [--out 结果.json]
+  python3 check.py selftest [--fixtures DIR]
 
-导出目录（bot 每次巡检建一个带时间戳的子目录）：
+导出目录（每次运行建一个带时间戳的子目录）：
   manifest.json  {"project": "流程治理", "exported_at": "...",
-                  "tables": [{"role": "B", "name": "bot 名册", "view_url": "view://..."} , ...],
-                  "sql": [{"role": "B", "file": "B-sql.txt"}]}        # sql 可省
+                  "tables": [{"role": "B", "name": "bot 名册", "view_url": "view://..."} , ...]}
   <role>-db.txt                    该数据库的 notion-fetch 结果（用来确认所用视图不带筛选）
   <role>-p1.txt, <role>-p2.txt ...   每页一个文件：CallDynamicTool(write_to_file) 的原样结果
-  role：F D R S P A（项目表）、T 模板表、B bot 名册、K skill 维护表、J 脚本维护表
+  role：F D R S P A（项目表）、B bot 名册（只在「流程治理」）
 
-哈希规范化与仓库 build/hash.py 完全一致（规范化 v2：frontmatter 只保留 name、description 的值并改写成固定两行，LF、行尾空白、首尾空行，不做任何替换）。
-结论分三类：发现（确定不一致）、降级（导出不完整或无法判定，不算不一致）、正常。
+本机对仓库比对（--governance；版本 = 克隆当前所在的 git tag）：
+  - 克隆：是否停在 tag 上、有没有本地改动、比本地已知的最新 tag 旧多少（最新 tag 由 bot 事先 git fetch --tags 取得，脚本不联网）。
+  - skill：本机每个 skill（按 frontmatter name）与克隆 skills/<slug>/SKILL.md 比；不一致时在各 tag 里找能对上的。
+  - bot：名册里每个没废弃的 bot，设定与它所用模板在各 tag 的版本比。模板里「〈项目名〉」换成所属项目；
+    设定里有「【项目专有补充】」一行的，只比到这一行（含），后面的补充段只和 --prev 的上次结果比。
+哈希一律调用克隆里的 build/hash.py。
+结论分三类：发现（确定不一致或落后）、降级（导出不完整、克隆不在 tag 上或有本地改动等，不算不一致）、正常。
 """
-import argparse, datetime, glob, hashlib, json, os, re, sys
+import argparse, datetime, glob, json, os, re, subprocess, sys
 
-VERSION = "v0.0.1-draft.3"
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_REPO = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(DEFAULT_REPO, "build"))
+import hash as H  # noqa: E402  仓库 build/hash.py
+
 ID_RE = re.compile(r"([0-9a-f]{32})")
-CURRENT_STATES = {"在用", "暂停", "退役"}          # 当前版本行可能的状态（模板/skill/脚本表只有在用）
-
-# ---------- 文本工具（可单测） ----------
-_ESC_CHARS = r"\*_`[]<>#~|"
-_ESC_RE = re.compile("([" + re.escape(_ESC_CHARS) + "])")
-
-def escape_md(text: str) -> str:
-    """写入 Notion 前转义：\\ * _ ` [ ] < > # ~ | 前加反斜杠。换行保持原样。"""
-    return _ESC_RE.sub(r"\\\1", text)
-
-# 单遍扫描：\x → x；<br> → 换行；[文字](http…) → 文字（Notion 自动加的链接，文字内部递归处理）
-_TOK = re.compile(r"\\(.)|<br>|\[((?:\\.|[^\]\\])*)\]\((https?://[^)]*)\)", re.S)
-
-def demarkdown2(v: str) -> str:
-    """把 view/fetch 返回的 markdown 化富文本还原成写入前的原文（前提：写入时做过 escape_md）。"""
-    def rep(m):
-        if m.group(1) is not None:
-            return m.group(1)
-        if m.group(0) == "<br>":
-            return "\n"
-        return demarkdown2(m.group(2))
-    return _TOK.sub(rep, v)
-
-def suspicious_unescaped(v: str) -> bool:
-    """还原前的值里出现未转义的 markdown 记号 → 原文写入时可能没转义，存储已被改写，不可判定。
-    只看明显记号：未转义的 * _ ` ~ #（链接、<br> 是 Notion 渲染产物，已由 demarkdown2 处理）。"""
-    s = _TOK.sub(lambda m: "" if m.group(1) is not None else ("\n" if m.group(0) == "<br>" else m.group(2)), v)
-    return bool(re.search(r"[*`~]", s))
-
-# 规范化 v2：与仓库 build/hash.py 逐字同一实现（frontmatter 只计 name、description 的值）
-KEYS = ("name", "description")
-
-class FrontmatterError(ValueError):
-    pass
-
-def _scalar(first: str, cont: list) -> str:
-    """first：键冒号后的文本（已去首尾空白）；cont：属于该键的后续行（原样）。"""
-    if first in (">+", "|+"):
-        raise FrontmatterError("保留尾部换行（+）写法不支持")
-    if first in (">", ">-", "|", "|-"):
-        ind = [len(l) - len(l.lstrip(" ")) for l in cont if l.strip()]
-        if not ind:
-            return ""
-        n = min(ind)
-        body = [l[n:] if l.strip() else "" for l in cont]
-        while body and body[-1] == "":
-            body.pop()
-        if first[0] == "|":
-            s = "\n".join(body)
-        else:  # 折叠：相邻非空行用空格连接，空行变换行；更深缩进的行保留换行
-            s, prev_more = "", False
-            for i, l in enumerate(body):
-                more = l.startswith((" ", "\t"))
-                if i == 0:
-                    s = l
-                elif l == "":
-                    s += "\n"
-                elif s.endswith("\n") or more or prev_more:
-                    s += ("" if s.endswith("\n") else "\n") + l
-                else:
-                    s += " " + l
-                prev_more = more
-        return s if first.endswith("-") else s + "\n"
-    if cont and any(l.strip() for l in cont) and first[:1] in ("'", '"'):
-        raise FrontmatterError("多行引号标量不支持")
-    if first[:1] == "'":
-        if not (len(first) >= 2 and first.endswith("'")):
-            raise FrontmatterError("单引号未闭合")
-        return first[1:-1].replace("''", "'")
-    if first[:1] == '"':
-        if not (len(first) >= 2 and first.endswith('"')) or "\\" in first:
-            raise FrontmatterError("双引号未闭合或含转义（不支持）")
-        return first[1:-1]
-    if first[:1] in ("[", "{", "&", "*", "!", "%", "@", "`"):
-        raise FrontmatterError("不支持的 YAML 写法")
-    parts = [first] + [l.strip() for l in cont]  # 普通多行：去缩进，用空格连接（空行→换行）
-    s = ""
-    for p in parts:
-        if p == "":
-            s += "\n"
-        elif s == "" or s.endswith("\n"):
-            s += p
-        else:
-            s += " " + p
-    return s.strip(" ")
-
-def _frontmatter(lines: list) -> dict:
-    vals, i = {}, 0
-    while i < len(lines):
-        m = re.match(r"^([A-Za-z_][\w-]*)\s*:(.*)$", lines[i])
-        if not m:
-            if lines[i].strip() == "" or lines[i].lstrip().startswith("#"):
-                i += 1; continue
-            raise FrontmatterError(f"frontmatter 第 {i + 2} 行无法解析")
-        key, first = m.group(1), m.group(2).strip()
-        j = i + 1
-        while j < len(lines) and (lines[j].startswith((" ", "\t")) or lines[j].strip() == ""):
-            j += 1
-        if key in KEYS:
-            if key in vals:
-                raise FrontmatterError(f"{key} 重复")
-            if " #" in first and first[:1] not in ("'", '"'):
-                first = first.split(" #", 1)[0].rstrip()
-            vals[key] = _scalar(first, lines[i + 1:j])
-        i = j
-    for k in KEYS:
-        if k not in vals:
-            raise FrontmatterError(f"frontmatter 缺 {k}")
-    return vals
-
-def normalize(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = text.split("\n")
-    if lines and lines[0].strip() == "---":
-        for i in range(1, len(lines)):
-            if lines[i].strip() == "---":
-                v = _frontmatter(lines[1:i])
-                head = [f"{k}: " + v[k].replace("\n", "\\n") for k in KEYS] + ["---"]
-                lines = head + lines[i + 1:]
-                break
-    return "\n".join(l.rstrip() for l in lines).strip("\n")
+CURRENT_STATES = {"在用", "暂停", "退役"}   # 名册里不是「已废弃」的状态
+PLACEHOLDER = "〈项目名〉"
+MARKER = "【项目专有补充】"
+PREFIX = {"F": "F", "D": "D", "R": "R", "S": "S", "P": "P", "A": "A", "B": "B"}
 
 def norm_hash(text: str) -> str:
-    return hashlib.sha256(normalize(text).encode("utf-8")).hexdigest()
+    return H.norm_hash_text(text)
 
-def file_norm_hash(path: str) -> str:
-    with open(path, encoding="utf-8-sig") as f:
-        return norm_hash(f.read())
-
+# ---------- 导出文件解析 ----------
 def page_id(url_or_id: str):
     m = ID_RE.search((url_or_id or "").replace("-", ""))
     return m.group(1) if m else None
@@ -166,11 +53,6 @@ def load_export(path: str) -> dict:
     if i < 0 or j < i:
         raise ValueError("文件里没有 JSON")
     return json.loads(s[i:j + 1])
-
-def fetch_properties(path: str) -> dict:
-    """notion-fetch 单页结果 → 属性字典。"""
-    t = load_export(path)["text"]
-    return json.loads(t[t.index("<properties>") + 12: t.index("</properties>")])
 
 def page_no(path):
     m = re.search(r"-p(\d+)\.txt$", path)
@@ -271,6 +153,68 @@ def numbering_gaps(rows, prefix):
         return []
     return [f"{prefix}-{i}" for i in range(1, nums[-1] + 1) if i not in set(nums)]
 
+# ---------- 本机克隆（git，只读） ----------
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip() or f"git {' '.join(args)} 失败")
+    return r.stdout
+
+def _vkey(tag):
+    m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+    return tuple(int(x) for x in m.groups()) if m else None
+
+def repo_state(repo):
+    """返回 {tag, commit, clean, tags(新→旧), latest}。"""
+    st = {"tag": None, "commit": git(repo, "rev-parse", "HEAD").strip()}
+    st["clean"] = git(repo, "status", "--porcelain").strip() == ""
+    tags = [t for t in git(repo, "tag", "--points-at", "HEAD").split() if _vkey(t)]
+    st["tag"] = max(tags, key=_vkey) if tags else None
+    all_tags = [t for t in git(repo, "tag").split() if _vkey(t)]
+    st["tags"] = sorted(all_tags, key=_vkey, reverse=True)
+    st["latest"] = st["tags"][0] if st["tags"] else None
+    return st
+
+def show(repo, ref, path):
+    """某个 tag 下的文件内容；不存在返回 None。"""
+    try:
+        return git(repo, "show", f"{ref}:{path}")
+    except RuntimeError:
+        return None
+
+def fm_name(text):
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines and lines[0].strip() == "---":
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                return H._frontmatter(lines[1:i])["name"]
+    return None
+
+def split_supplement(text):
+    """按「【项目专有补充】」一行拆成（模板部分含该行, 补充段或 None）。"""
+    lines = text.replace("\r\n", "\n").split("\n")
+    for i, l in enumerate(lines):
+        if l.strip() == MARKER:
+            return "\n".join(lines[:i + 1]), "\n".join(lines[i + 1:])
+    return text, None
+
+def fill(template, project):
+    return template.replace(PLACEHOLDER, project or PLACEHOLDER)
+
+def matching_tags(repo, tags, path, want_hash, transform=lambda s: s):
+    """在 tags（新→旧）里找 transform(文件) 的哈希等于 want_hash 的 tag。"""
+    hits = []
+    for t in tags:
+        s = show(repo, t, path)
+        if s is None:
+            continue
+        try:
+            if norm_hash(transform(s)) == want_hash:
+                hits.append(t)
+        except H.FrontmatterError:
+            continue
+    return hits
+
 # ---------- 本机当前值 ----------
 def local_skills(workflows_dir):
     """frontmatter name → [(路径, 规范化哈希)]"""
@@ -285,7 +229,7 @@ def local_skills(workflows_dir):
         if m:
             try:
                 h = norm_hash(s)
-            except FrontmatterError as e:
+            except H.FrontmatterError as e:
                 h = f"frontmatter 无法解析：{e}"
             res.setdefault(m.group(1).strip().strip("'\""), []).append((p, h))
     return res
@@ -318,148 +262,146 @@ def current_rows(rows, key):
             by.setdefault(str(r.get(key, "")).strip(), []).append(r)
     return by
 
-def check_text_integrity(rep, table, obj, row, field):
-    """登记的全文（view 还原）与登记哈希是否一致。不一致或可疑一律降级，不判不一致。"""
-    v, h = row.get(field), str(row.get("内容哈希", "")).strip()
-    if not v:
-        rep.degrade(table, obj, f"{field} 为空")
-        return
-    if re.fullmatch(r"\s*(见|https?://)\S*.*", v) and len(v) < 200 and "notion" in v:
-        rep.degrade(table, obj, f"{field} 是子页面链接，脚本不跟读")
-        return
-    restored = demarkdown2(v)
-    if norm_hash(restored) == h:
-        rep.good(table, obj, f"{field} 还原后哈希与登记一致")
-    elif suspicious_unescaped(v):
-        rep.degrade(table, obj, f"{field} 有未转义 markdown 记号，写入时可能没转义，无法还原判定")
-    else:
-        rep.degrade(table, obj, f"{field} 还原后哈希 {norm_hash(restored)[:12]} ≠ 登记 {h[:12]}，无法判定（可走 SQL 抽查）")
+def check_repo(rep, st):
+    if not st["tag"]:
+        rep.degrade("仓库", "克隆", f"不在任何 tag 上（提交 {st['commit'][:12]}）")
+    if not st["clean"]:
+        rep.degrade("仓库", "克隆", "有本地改动，不是发布版")
+    if st["tag"] and st["latest"] and _vkey(st["latest"]) > _vkey(st["tag"]):
+        rep.find("落后", "仓库", "本机克隆", f"本机 {st['tag']}，仓库最新 {st['latest']}")
+    elif st["tag"]:
+        rep.good("仓库", "本机克隆", f"停在 {st['tag']}，是已知最新")
 
-def check_sql(rep, export_dir, manifest, tables):
-    """可选：SQL 抽查文件（SELECT url, 设定正文, 内容哈希 …），原文无需还原，直接比。"""
-    for s in manifest.get("sql", []):
-        role, f = s.get("role"), os.path.join(export_dir, s.get("file", ""))
+def check_skills(rep, repo, st, workflows_dir):
+    skills = local_skills(workflows_dir)
+    for p in sorted(glob.glob(os.path.join(repo, "skills", "*", "SKILL.md"))):
+        rel = os.path.relpath(p, repo)
+        text = open(p, encoding="utf-8-sig").read()
         try:
-            j = load_export(f)
-        except Exception as e:
-            rep.degrade(role, "SQL 抽查", f"文件读不到：{e}")
+            name, want = fm_name(text), norm_hash(text)
+        except H.FrontmatterError as e:
+            rep.find("仓库 skill frontmatter 无法解析", "skill", rel, str(e))
             continue
-        if "error" in j:
-            rep.degrade(role, "SQL 抽查", f"SQL 不可用（{j['error'].get('code')}），本次未抽查")
-            continue
-        field = {"B": "设定正文", "T": "设定正文"}.get(role)
-        for r in j.get("results", []):
-            v, h = r.get(field), str(r.get("内容哈希", "")).strip()
-            if v is None or not h:
-                continue
-            obj = r.get("编号") or page_id(r.get("url", ""))
-            if norm_hash(v) == h:
-                rep.good(role, obj, "SQL 原文哈希与登记一致")
+        loc = skills.get(name, [])
+        if not loc:
+            rep.find("本机缺 skill", "skill", name, "workflows 下没有 frontmatter name 为该名的 SKILL.md")
+        elif len(loc) > 1:
+            rep.find("本机同名 skill 多份", "skill", name, "；".join(x for x, _ in loc))
+        elif loc[0][1].startswith("frontmatter"):
+            rep.find("skill frontmatter 无法解析", "skill", name, f"{loc[0][0]}：{loc[0][1]}")
+        elif loc[0][1] == want:
+            rep.good("skill", name, f"本机与克隆一致 {want[:12]}")
+        else:
+            hits = matching_tags(repo, st["tags"], rel, loc[0][1])
+            if hits:
+                rep.find("落后", "skill", name, f"本机等于 {hits[0]}，克隆是 {st['tag'] or st['commit'][:12]}")
             else:
-                rep.find("登记原文与哈希不符", role, obj, f"SQL 原文 {norm_hash(v)[:12]} ≠ 登记 {h[:12]}")
+                rep.find("本机被改过", "skill", name, f"本机 {loc[0][1][:12]} 对不上仓库任何 tag")
+
+def check_bots(rep, repo, st, rows, agents_dir, prev_supp):
+    supp = {}
+    by = {}
+    for r in rows:
+        if str(r.get("状态", "")).strip() in CURRENT_STATES:
+            by.setdefault(str(r.get("bot ID", "")).strip(), []).append(r)
+    for bid, rs in by.items():
+        obj = f"{rs[0].get('名称')}（{bid}）"
+        if len(rs) > 1:
+            rep.find("同一 bot 多行没废弃", "B", obj, ",".join(str(r.get("编号", "")) for r in rs))
+            continue
+        r = rs[0]
+        desc, err = agent_description(agents_dir, bid)
+        if err:
+            if "不存在" in err:
+                rep.find("名册有而平台没有", "B", obj, err)
+            else:
+                rep.degrade("B", obj, err)
+            continue
+        if str(r.get("状态", "")).strip() != "在用":
+            continue
+        used = str(r.get("所用模板", "")).strip()
+        m = re.fullmatch(r"([\w.-]+\.md)(?:@(\S+))?", used)
+        if not m:
+            rep.degrade("B", obj, f"所用模板「{used}」不是 templates/ 里的文件，脚本不核对")
+            continue
+        path, project = f"templates/{m.group(1)}", str(r.get("所属项目", "")).strip()
+        body, sup = split_supplement(desc or "")
+        cur = norm_hash(body)
+        hits = matching_tags(repo, st["tags"], path, cur, lambda s: split_supplement(fill(s, project))[0])
+        if not hits:
+            rep.find("设定被改过", "B", obj, f"模板部分 {cur[:12]} 对不上 {path} 的任何 tag")
+        elif st["tag"] in hits:
+            rep.good("B", obj, f"设定等于 {path}@{st['tag']}")
+        else:
+            rep.find("落后", "B", obj, f"设定等于 {path}@{hits[0]}，克隆是 {st['tag'] or st['commit'][:12]}")
+        if hits and m.group(2) and m.group(2) not in hits:
+            rep.find("名册所用模板与实际不符", "B", obj, f"名册写 {used}，实际等于 @{hits[0]}")
+        if sup is not None:
+            h = norm_hash(sup)
+            supp[bid] = h
+            if bid in prev_supp and prev_supp[bid] != h:
+                rep.find("补充段有变化", "B", obj, f"{prev_supp[bid][:12]} → {h[:12]}")
+    return supp
 
 def run(args):
-    ed = args.export_dir
-    manifest = json.load(open(os.path.join(ed, "manifest.json"), encoding="utf-8"))
     rep, tables = Report(), {}
-    for t in manifest["tables"]:
-        role = t["role"]
-        info = read_table(ed, role)
-        tables[role] = {"名称": t.get("name"), "视图": t.get("view_url"), "行数": len(info["rows"]),
-                        "页数": info["pages"], "完整": info["complete"], "问题": info["issues"]}
-        vi = None if args.skip_view_check else view_filter_issue(ed, role, t.get("view_url"))
-        if vi:
-            info["issues"].append(vi)
-            info["complete"] = False
-        tables[role]["完整"], tables[role]["问题"] = info["complete"], info["issues"]
-        if not info["complete"]:
-            rep.degrade(role, t.get("name"), "导出不完整：" + "；".join(info["issues"]))
-        prefix = {"F": "F", "D": "D", "R": "R", "S": "S", "P": "P", "A": "A",
-                  "T": "T", "B": "B", "K": "K", "J": "J"}.get(role)
-        gaps = numbering_gaps(info["rows"], prefix) if info["complete"] else []
-        if gaps:
-            rep.find("编号缺号", role, t.get("name"), "缺 " + ",".join(gaps[:20]))
-        tables[role]["_rows"] = info["rows"]
-    # 行数单调不减
+    repo = os.path.abspath(args.repo)
+    prev = {}
     if args.prev and os.path.exists(args.prev):
-        prev = json.load(open(args.prev, encoding="utf-8")).get("表", {})
-        for role, t in tables.items():
-            p = prev.get(role, {})
+        prev = json.load(open(args.prev, encoding="utf-8"))
+    manifest = {}
+    if args.export_dir:
+        ed = args.export_dir
+        manifest = json.load(open(os.path.join(ed, "manifest.json"), encoding="utf-8"))
+        for t in manifest["tables"]:
+            role = t["role"]
+            info = read_table(ed, role)
+            vi = None if args.skip_view_check else view_filter_issue(ed, role, t.get("view_url"))
+            if vi:
+                info["issues"].append(vi)
+                info["complete"] = False
+            tables[role] = {"名称": t.get("name"), "视图": t.get("view_url"), "行数": len(info["rows"]),
+                            "页数": info["pages"], "完整": info["complete"], "问题": info["issues"]}
+            if not info["complete"]:
+                rep.degrade(role, t.get("name"), "导出不完整：" + "；".join(info["issues"]))
+            gaps = numbering_gaps(info["rows"], PREFIX.get(role, role)) if info["complete"] else []
+            if gaps:
+                rep.find("编号缺号", role, t.get("name"), "缺 " + ",".join(gaps[:20]))
+            tables[role]["_rows"] = info["rows"]
+        for role, t in tables.items():   # 行数单调不减
+            p = prev.get("表", {}).get(role, {})
             if t["完整"] and p.get("完整") and t["行数"] < p.get("行数", 0):
                 rep.find("行数减少", role, t["名称"], f"{p['行数']} → {t['行数']}")
-    skills = local_skills(args.workflows_dir)
-    # B bot 名册
-    b = tables.get("B")
-    if b and b["完整"]:
-        for bid, rs in current_rows(b["_rows"], "bot ID").items():
-            obj = f"{rs[0].get('名称')}（{bid}）"
-            if len(rs) > 1:
-                rep.find("多行当前版本", "B", obj, ",".join(r.get("编号", "") for r in rs))
-                continue
-            r = rs[0]
-            check_text_integrity(rep, "B", obj + " " + str(r.get("编号")), r, "设定正文")
-            desc, err = agent_description(args.agents_dir, bid)
-            if err:
-                (rep.find if "不存在" in err else rep.degrade)(*(("名册有而平台没有", "B", obj, err) if "不存在" in err else ("B", obj, err)))
-                continue
-            cur, reg = norm_hash(desc or ""), str(r.get("内容哈希", "")).strip()
-            if cur == reg:
-                rep.good("B", obj, "当前设定与在用行哈希一致")
-            else:
-                rep.find("设定正文不一致", "B", obj, f"当前 {cur[:12]} ≠ 在用行 {reg[:12]}（{r.get('编号')}）")
-    # T 模板表
-    t = tables.get("T")
-    if t and t["完整"]:
-        for name, rs in current_rows(t["_rows"], "模板名").items():
-            if len(rs) > 1:
-                rep.find("多行当前版本", "T", name, ",".join(r.get("编号", "") for r in rs))
-                continue
-            check_text_integrity(rep, "T", f"{name} {rs[0].get('编号')}", rs[0], "设定正文")
-    # K skill 维护表：比本机 skill 规范化哈希（全文在行页面正文/附件，不在属性里，不还原）
-    k = tables.get("K")
-    if k and k["完整"]:
-        for name, rs in current_rows(k["_rows"], "skill 名称").items():
-            if len(rs) > 1:
-                rep.find("多行当前版本", "K", name, ",".join(r.get("编号", "") for r in rs))
-                continue
-            reg = str(rs[0].get("内容哈希", "")).strip()
-            loc = skills.get(name, [])
-            if not loc:
-                rep.find("本机缺 skill", "K", name, "workflows 下没有 frontmatter name 为该名的 SKILL.md")
-            elif len(loc) > 1:
-                rep.find("本机同名 skill 多份", "K", name, "；".join(p for p, _ in loc))
-            elif loc[0][1].startswith("frontmatter"):
-                rep.find("skill frontmatter 无法解析", "K", name, f"{loc[0][0]}：{loc[0][1]}")
-            elif loc[0][1] == reg:
-                rep.good("K", name, f"本机哈希与在用行一致 {reg[:12]}")
-            else:
-                rep.find("skill 不一致", "K", name, f"本机 {loc[0][1][:12]} ≠ 在用行 {reg[:12]}（{rs[0].get('编号')}）")
-    # J 脚本维护表：比本脚本自身
-    j = tables.get("J")
-    if j and j["完整"]:
-        me = file_norm_hash(os.path.abspath(__file__))
-        rs = current_rows(j["_rows"], "脚本名称").get("检查脚本", [])
-        if not rs:
-            rep.degrade("J", "检查脚本", "脚本维护表没有检查脚本在用行")
-        elif len(rs) > 1:
-            rep.find("多行当前版本", "J", "检查脚本", ",".join(r.get("编号", "") for r in rs))
-        elif not re.fullmatch(r"[0-9a-f]{64}", str(rs[0].get("内容哈希", "")).strip()):
-            rep.degrade("J", "检查脚本", f"在用行内容哈希不是有效哈希（{rs[0].get('内容哈希')}），脚本未登记")
-        elif rs[0]["内容哈希"].strip() == me:
-            rep.good("J", "检查脚本", f"本脚本哈希与在用行一致 {me[:12]}")
-        else:
-            rep.find("脚本不一致", "J", "检查脚本", f"本脚本 {me[:12]} ≠ 在用行 {rs[0]['内容哈希'][:12]}")
-    check_sql(rep, ed, manifest, tables)
+    try:
+        st = repo_state(repo)
+    except Exception as e:
+        st = None
+        rep.degrade("仓库", repo, f"读不到 git 信息：{e}")
+    if st:
+        check_repo(rep, st)
+    supp = {}
+    if args.governance and st:
+        check_skills(rep, repo, st, args.workflows_dir)
+        b = tables.get("B")
+        if b and b["完整"]:
+            supp = check_bots(rep, repo, st, b["_rows"], args.agents_dir, prev.get("补充段哈希", {}))
+        elif args.export_dir and b is None:
+            rep.degrade("B", "bot 名册", "导出里没有 B，bot 设定未核对")
     for t in tables.values():
         t.pop("_rows", None)
     status = "降级" if rep.degraded else ("有发现" if rep.findings else "正常")
-    result = {"脚本": "检查脚本", "版本": VERSION, "脚本哈希": file_norm_hash(os.path.abspath(__file__)),
+    ver = ({"tag": st["tag"], "提交号": st["commit"], "干净": st["clean"], "已知最新 tag": st["latest"]}
+           if st else None)
+    result = {"脚本": "检查脚本", "仓库版本": ver,
               "运行时间": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-              "导出目录": os.path.abspath(ed), "项目": manifest.get("project"), "状态": status,
-              "覆盖范围": "导出完整性、编号连续、行数不减、治理哈希比对（参谋长治理第 5 节第 2 项）",
+              "导出目录": os.path.abspath(args.export_dir) if args.export_dir else None,
+              "项目": manifest.get("project"), "状态": status,
+              "覆盖范围": "导出完整性、编号连续、行数不减" + ("、本机对仓库比对（参谋长治理第 5 节第 2 项）" if args.governance else ""),
               "人工检查项": "通用流程第 10 节机械项 1–11 不归本脚本，由人工按清单检查（不算降级）",
-              "表": tables, "发现": rep.findings, "降级": rep.degraded, "正常项数": len(rep.ok), "正常项": rep.ok}
-    lines = [f"检查脚本 {VERSION}：{status}。{len(tables)} 张表，"
+              "表": tables, "发现": rep.findings, "降级": rep.degraded, "正常项数": len(rep.ok), "正常项": rep.ok,
+              "补充段哈希": supp}
+    v = f"{st['tag'] or st['commit'][:12]}{'' if st['clean'] else '（有本地改动）'}" if st else "未知"
+    lines = [f"检查脚本（仓库版本 {v}）：{status}。{len(tables)} 张表，"
              f"{sum(t['行数'] for t in tables.values())} 行；发现 {len(rep.findings)} 条，降级 {len(rep.degraded)} 条，正常 {len(rep.ok)} 项。"]
     lines += [f"- 发现｜{x['表']}｜{x['对象']}｜{x['类型']}：{x['详情']}" for x in rep.findings]
     lines += [f"- 降级｜{x['表']}｜{x['对象']}：{x['原因']}" for x in rep.degraded]
@@ -470,37 +412,14 @@ def run(args):
     print(result["摘要"])
     return {"正常": 0, "有发现": 1, "降级": 2}[status]
 
-def cmd_escape(args):
-    sys.stdout.write(escape_md(open(args.file, encoding="utf-8").read()))
-    return 0
-
-def cmd_verify(args):
-    orig = open(args.original, encoding="utf-8").read()
-    j = load_export(args.export)
-    if "results" in j:
-        rows = [r for r in j["results"] if page_id(r.get("url", "")) == page_id(args.page_id)]
-        if not rows:
-            print("导出里找不到该行"); return 2
-        v = rows[0].get(args.field)
-    else:
-        t = j["text"]; v = json.loads(t[t.index("<properties>") + 12: t.index("</properties>")]).get(args.field)
-    a, b = norm_hash(demarkdown2(v or "")), norm_hash(orig)
-    print(json.dumps({"一致": a == b, "读回还原哈希": a, "原文哈希": b}, ensure_ascii=False))
-    return 0 if a == b else 1
-
 # ---------- 自测 ----------
 def selftest(args):
+    import tempfile, shutil
     ok = True
     def check(name, cond):
         nonlocal ok
         ok &= bool(cond)
         print(("通过 " if cond else "失败 ") + name)
-    cases = ["a*b*c", "C:\\tmp\\x", "字面<br>标签", "[a](b)", "x_y #h ~s~ |t| `c`", "多行\n第二行\n", "【中文】"]
-    for s in cases:   # 模拟 Notion：存储=转义解析后的原文，view 渲染时再转义、换行→<br>
-        check(f"往返 {s!r}", demarkdown2(escape_md(s).replace("\n", "<br>")) == s)
-    check("自动链接还原", demarkdown2("文件 [SKILL.md](http://SKILL.md) 与 x") == "文件 SKILL.md 与 x")
-    check("转义的 [a](http://b) 不当链接", demarkdown2(escape_md("[a](http://b)")) == "[a](http://b)")
-    check("未转义可疑识别", suspicious_unescaped("中文测试*星号*") and not suspicious_unescaped(escape_md("a*b")))
     check("包裹/无包裹都能解析", load_export_str('<x>\n\n{"a":1}\n\n</x>') == {"a": 1} and load_export_str('{"a":1}') == {"a": 1})
     check("page_id 两种 url", page_id("https://app.notion.com/p/3fbbfd313847814180a0da1b9ee091b5") ==
           page_id("https://app.notion.com/3fbbfd313847814180a0da1b9ee091b5") == "3fbbfd313847814180a0da1b9ee091b5")
@@ -508,40 +427,76 @@ def selftest(args):
     check("筛选识别：其他 filter 类键", filter_key({"quickFilters": [{"property": "状态"}]}) == "quickFilters"
           and filter_key({"format": {"filter": {"a": 1}}}) == "format.filter")
     check("筛选识别：分组/空值不算", filter_key({"groupBy": {"hideEmptyGroups": True}, "filter": None, "quickFilters": []}) is None)
+    check("编号缺号", numbering_gaps([{"编号": "B-1"}, {"编号": "B-3"}], "B") == ["B-2"])
     fm1 = "---\nname: 甲\ndescription: 一 二 bot 三\n---\n正文\n"
     fm2 = "---\nname: 甲\ndescription: >-\n  一 二\n  bot 三\nmetadata:\n  k: v\n---\n正文  \n\n"
-    check("规范化 v2：描述同值不同写法（单行 / >- 折行 / 多余键）哈希相同", norm_hash(fm1) == norm_hash(fm2))
-    check("规范化 v2：改描述哈希变", norm_hash(fm1) != norm_hash(fm1.replace("三", "四")))
-    check("规范化 v2：改 name 哈希变", norm_hash(fm1) != norm_hash(fm1.replace("name: 甲", "name: 乙")))
-    check("规范化 v2：无 frontmatter 与 v1 相同", normalize("a  \n\nb\n") == "a\n\nb")
+    check("调用 build/hash.py：描述同值不同写法哈希相同", norm_hash(fm1) == norm_hash(fm2))
+    check("调用 build/hash.py：改描述哈希变", norm_hash(fm1) != norm_hash(fm1.replace("三", "四")))
+    tpl = "你是副官·〈项目名〉，项目〈项目名〉。\n冲突时以守则为准。\n【项目专有补充】\n"
+    body, sup = split_supplement(fill(tpl, "记账") + "说中文。\n不要打印密码。")
+    check("填项目名并按补充行拆分", body.endswith("【项目专有补充】") and "〈项目名〉" not in body and sup.strip() == "说中文。\n不要打印密码。")
+    check("没有补充行时整段当模板部分", split_supplement("甲\n乙") == ("甲\n乙", None))
+    # 临时仓库：两个 tag
+    tmp = tempfile.mkdtemp()
     try:
-        norm_hash("---\nname: 甲\n---\n正文"); check("规范化 v2：缺 description 报错", False)
-    except FrontmatterError:
-        check("规范化 v2：缺 description 报错", True)
+        repo, wf, ag = os.path.join(tmp, "repo"), os.path.join(tmp, "wf"), os.path.join(tmp, "agents")
+        os.makedirs(os.path.join(repo, "skills", "gf")); os.makedirs(os.path.join(repo, "templates"))
+        def w(p, s):
+            os.makedirs(os.path.dirname(p), exist_ok=True); open(p, "w", encoding="utf-8").write(s)
+        g = lambda *a: subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True, check=True)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        g("config", "user.email", "t@t"); g("config", "user.name", "t")
+        sk1 = "---\nname: 通用流程\ndescription: 测试\n---\n旧正文\n"
+        sk2 = sk1.replace("旧正文", "新正文")
+        w(os.path.join(repo, "skills", "gf", "SKILL.md"), sk1); w(os.path.join(repo, "templates", "deputy.md"), tpl)
+        g("add", "-A"); g("commit", "-qm", "a"); g("tag", "v1.0.0")
+        w(os.path.join(repo, "skills", "gf", "SKILL.md"), sk2)
+        w(os.path.join(repo, "templates", "deputy.md"), tpl.replace("冲突时", "冲突时一律"))
+        g("add", "-A"); g("commit", "-qm", "b"); g("tag", "v1.1.0")
+        st = repo_state(repo)
+        check("tag 识别：停在 v1.1.0、干净、最新", st["tag"] == "v1.1.0" and st["clean"] and st["latest"] == "v1.1.0")
+        w(os.path.join(wf, "s1", "SKILL.md"), sk1)        # 本机是旧版
+        rep = Report(); check_skills(rep, repo, st, wf)
+        check("skill 落后到旧 tag", any(f["类型"] == "落后" and "v1.0.0" in f["详情"] for f in rep.findings))
+        w(os.path.join(wf, "s1", "SKILL.md"), sk2.replace("新正文", "乱改"))
+        rep = Report(); check_skills(rep, repo, st, wf)
+        check("skill 本机被改过", any(f["类型"] == "本机被改过" for f in rep.findings))
+        w(os.path.join(wf, "s1", "SKILL.md"), sk2)
+        rep = Report(); check_skills(rep, repo, st, wf)
+        check("skill 与克隆一致", not rep.findings and rep.ok)
+        def bot(bid, desc):
+            w(os.path.join(ag, bid, "profile.json"), json.dumps({"description": desc}, ensure_ascii=False))
+        bot("b1", fill(tpl, "记账") + "说中文。")                                   # 旧模板 + 补充
+        bot("b2", fill(tpl.replace("冲突时", "冲突时一律"), "记账"))                 # 新模板
+        bot("b3", "你是副官·记账，随便改的。\n【项目专有补充】\n")                     # 被改过
+        rows = [{"编号": "B-1", "bot ID": "b1", "名称": "副官·记账", "所属项目": "记账", "所用模板": "deputy.md@v1.0.0", "状态": "在用"},
+                {"编号": "B-2", "bot ID": "b2", "名称": "副官·记账2", "所属项目": "记账", "所用模板": "deputy.md@v1.0.0", "状态": "在用"},
+                {"编号": "B-3", "bot ID": "b3", "名称": "副官·记账3", "所属项目": "记账", "所用模板": "deputy.md@v1.1.0", "状态": "在用"},
+                {"编号": "B-4", "bot ID": "gone", "名称": "副官·旧", "所属项目": "旧", "所用模板": "deputy.md@v1.0.0", "状态": "在用"}]
+        rep = Report(); supp = check_bots(rep, repo, st, rows, ag, {})
+        kinds = {(f["对象"].split("（")[1].rstrip("）"), f["类型"]) for f in rep.findings}
+        check("bot 停在旧模板 → 落后（补充段不参与）", ("b1", "落后") in kinds)
+        check("bot 等于当前模板 → 正常；名册版本与实际不符 → 报", ("b2", "落后") not in kinds and ("b2", "名册所用模板与实际不符") in kinds)
+        check("bot 模板部分被改 → 设定被改过", ("b3", "设定被改过") in kinds)
+        check("名册有而平台没有", ("gone", "名册有而平台没有") in kinds)
+        bot("b1", fill(tpl, "记账") + "说英文。")
+        rep = Report(); check_bots(rep, repo, st, rows, ag, supp)
+        check("补充段和上次比有变化 → 报", any(f["类型"] == "补充段有变化" and "b1" in f["对象"] for f in rep.findings))
+        g("checkout", "-q", "v1.0.0")
+        rep = Report(); check_repo(rep, repo_state(repo))
+        check("克隆停在旧 tag → 落后", any(f["类型"] == "落后" and "v1.1.0" in f["详情"] for f in rep.findings))
+        w(os.path.join(repo, "x.txt"), "脏")
+        rep = Report(); check_repo(rep, repo_state(repo))
+        check("克隆有本地改动 → 降级", any("本地改动" in d["原因"] for d in rep.degraded))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     fx = args.fixtures
     if fx:
-        g = os.path.join(fx, "grouped", "db_fetch.txt")
-        if os.path.exists(g):
-            check("分组视图（隐藏空组）判为不带筛选", _vf_text(g, "3febfd31-3847-8194-b96d-000c27ae739e") is None)
-            check("分组视图（显示空组）判为不带筛选", _vf_text(g, "3febfd31-3847-812a-9afd-000cb39f5d09") is None)
-            check("默认（排除已废弃）判为带筛选", (_vf_text(g, "3febfd31-3847-8156-a3c6-000cd7920352") or "").startswith("advancedFilter"))
-        e = os.path.join(fx, "boundary", "fetch_E8000.txt")
-        o = os.path.join(fx, "boundary", "originals.json")
-        if os.path.exists(e) and os.path.exists(o):
-            v = fetch_properties(e)["长文"]
-            orig = json.load(open(o, encoding="utf-8"))["L8000"]
-            check(f"E8000 fetch 还原==原文（{len(v)}→{len(demarkdown2(v))} 字）", demarkdown2(v) == orig)
-            r = json.load(open(o, encoding="utf-8"))
-            vs = {x["名称"]: x["长文"] for x in load_export(os.path.join(fx, "boundary", "view_p3.txt"))["results"] if x["名称"].startswith("L")}
-            for n in sorted(vs, key=lambda k: int(k[1:])):
-                check(f"{n} 未转义写入→判为可疑（不误判一致）", suspicious_unescaped(vs[n]) and demarkdown2(vs[n]) != r[n])
-        b = os.path.join(fx, "B_view_all.txt"); t = os.path.join(fx, "T_rows.txt")
-        if os.path.exists(b) and os.path.exists(t):
-            for f in (b, t):
-                for r in load_export(f)["results"]:
-                    if r.get("设定正文"):
-                        check(f"流程治理 {r.get('编号')} 设定正文还原后哈希==登记",
-                              norm_hash(demarkdown2(r["设定正文"])) == r["内容哈希"])
+        gfile = os.path.join(fx, "grouped", "db_fetch.txt")
+        if os.path.exists(gfile):
+            check("分组视图（隐藏空组）判为不带筛选", _vf_text(gfile, "3febfd31-3847-8194-b96d-000c27ae739e") is None)
+            check("分组视图（显示空组）判为不带筛选", _vf_text(gfile, "3febfd31-3847-812a-9afd-000cb39f5d09") is None)
+            check("默认（排除已废弃）判为带筛选", (_vf_text(gfile, "3febfd31-3847-8156-a3c6-000cd7920352") or "").startswith("advancedFilter"))
     print("自测" + ("全部通过" if ok else "有失败"))
     return 0 if ok else 1
 
@@ -555,19 +510,18 @@ def load_export_str(s):
     return json.loads(s[i:j + 1])
 
 def main():
-    ap = argparse.ArgumentParser(description="流程治理检查脚本")
+    ap = argparse.ArgumentParser(description="流程检查脚本")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run"); r.add_argument("--export-dir", required=True)
+    r = sub.add_parser("run"); r.add_argument("--export-dir")
+    r.add_argument("--governance", action="store_true", help="参谋长用：本机对仓库比对（skill、bot 设定、落后清单）")
+    r.add_argument("--repo", default=DEFAULT_REPO, help="本机克隆，默认是本脚本所在的仓库")
     r.add_argument("--agents-dir", default="/home/box/agent-data/agents")
     r.add_argument("--workflows-dir", default="/home/box/agent-data/workflows")
     r.add_argument("--prev"); r.add_argument("--out")
     r.add_argument("--skip-view-check", action="store_true", help="只用于自测旧导出：不核对视图是否带筛选")
-    e = sub.add_parser("escape"); e.add_argument("file")
-    v = sub.add_parser("verify-text"); v.add_argument("--original", required=True); v.add_argument("--export", required=True)
-    v.add_argument("--page-id", required=True); v.add_argument("--field", required=True)
     s = sub.add_parser("selftest"); s.add_argument("--fixtures")
     a = ap.parse_args()
-    return {"run": run, "escape": cmd_escape, "verify-text": cmd_verify, "selftest": selftest}[a.cmd](a)
+    return {"run": run, "selftest": selftest}[a.cmd](a)
 
 if __name__ == "__main__":
     sys.exit(main())
