@@ -1,5 +1,7 @@
 """用法：python3 build/hash.py 路径/SKILL.md [更多路径...]
-输出规范化 SHA-256（规范化 v2，与 skill「参谋长治理」第 5 节一致；纯标准库）：
+      python3 build/hash.py --diff 甲 乙     # 两份规范化文本第一处不同的行号和前后各两行（找手抄出错的那一行）
+      路径写 - 表示从标准输入读（比如 bot 设定正文：把 profile.json 的 description 管道进来）
+输出规范化 SHA-256（规范化 v2，与 skill「flow-chief-governance」（参谋长治理）第 5 节一致；纯标准库）：
 1. 统一换行 LF；
 2. 若首行是 ---，到下一个 --- 行为 frontmatter：只取 name 和 description 两个键的值（按 YAML 标量解析：
    普通、单/双引号、折叠 > >-、字面 | |-，多行续行），改写成两行「name: 值」「description: 值」（值里的换行写成 \\n），
@@ -104,17 +106,49 @@ def normalize(text: str) -> str:
 def norm_hash_text(text: str) -> str:
     return hashlib.sha256(normalize(text).encode("utf-8")).hexdigest()
 
+def first_diff(a: str, b: str):
+    """两份文本规范化后第一处不同：返回 None（相同）或 (行号, 甲的上下文, 乙的上下文)，上下文是前后各两行。"""
+    la, lb = normalize(a).split("\n"), normalize(b).split("\n")
+    for i in range(max(len(la), len(lb))):
+        if i >= len(la) or i >= len(lb) or la[i] != lb[i]:
+            ctx = lambda ls: [(j + 1, ls[j]) for j in range(max(0, i - 2), min(len(ls), i + 3))]
+            return i + 1, ctx(la), ctx(lb)
+    return None
+
+
 def norm_hash(path: str) -> str:
     with open(path, encoding="utf-8-sig") as f:
         return norm_hash_text(f.read())
 
+def _read(p: str) -> str:
+    if p == "-":
+        data = sys.stdin.buffer.read().decode("utf-8")
+        return data[1:] if data.startswith("\ufeff") else data
+    with open(p, encoding="utf-8-sig") as f:
+        return f.read()
+
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--diff":
+        try:
+            ta, tb = (_read(p) for p in sys.argv[2:4])
+            d = first_diff(ta, tb)
+        except (OSError, FrontmatterError) as e:
+            sys.exit(f"错误：{e}")
+        if d is None:
+            print("规范化后完全相同")
+            sys.exit(0)
+        print(f"第一处不同在规范化后第 {d[0]} 行")
+        for label, ctx in (("甲 " + sys.argv[2], d[1]), ("乙 " + sys.argv[3], d[2])):
+            print(label)
+            for n, line in ctx:
+                print(f"{'>' if n == d[0] else ' '} {n:5d}  {line}")
+        sys.exit(1)
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     bad = 0
     for p in sys.argv[1:]:
         try:
-            print(norm_hash(p) + "  " + p)
+            print(norm_hash_text(_read(p)) + "  " + p)
         except FrontmatterError as e:
             print(f"错误  {p}：{e}", file=sys.stderr); bad = 1
     sys.exit(bad)
